@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import { createServer } from 'node:http'
 
 const hostname = '0.0.0.0'
