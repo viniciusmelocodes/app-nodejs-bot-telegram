@@ -2,7 +2,7 @@ import 'dotenv/config'
 import { createServer } from 'node:http'
 import { sendTelegramMessage } from './telegram.js'
 
-const hostname = '0.0.0.0'
+const hostname = process.env.HOST || '0.0.0.0'
 const port = process.env.PORT || 3000
 
 const server = createServer(async (req, res) => {
