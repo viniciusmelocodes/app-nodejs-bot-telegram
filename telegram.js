@@ -1,23 +1,49 @@
-import { appendFile, mkdir, open } from 'node:fs/promises'
-import { request } from 'node:https'
+import { appendFile, mkdir, open, rename, rm, stat } from 'node:fs/promises'
 
 const logDirectory = new URL('./logs/', import.meta.url)
 const logFile = new URL('./logs/telegram-messages.txt', import.meta.url)
+const rotatedLogFile = new URL('./logs/telegram-messages.txt.1', import.meta.url)
+const maxLogFileBytes = 5 * 1024 * 1024
+const requestTimeoutMs = 10_000
+let logWriteQueue = Promise.resolve()
 
 async function logTelegramMessage(entry) {
-    try {
+    const write = async () => {
         await mkdir(logDirectory, { recursive: true })
-        await appendFile(logFile, `${JSON.stringify(entry)}\n`, 'utf8')
+
+        let currentSize = 0
+        try {
+            currentSize = (await stat(logFile)).size
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                throw error
+            }
+        }
+
+        const line = `${JSON.stringify(entry)}\n`
+        if (currentSize > 0 && currentSize + Buffer.byteLength(line) > maxLogFileBytes) {
+            await rm(rotatedLogFile, { force: true })
+            await rename(logFile, rotatedLogFile)
+        }
+
+        await appendFile(logFile, line, 'utf8')
+    }
+
+    const pendingWrite = logWriteQueue.then(write, write)
+    logWriteQueue = pendingWrite.catch(() => {})
+
+    try {
+        await pendingWrite
     } catch (error) {
         console.error('Não foi possível registrar o log do Telegram:', error)
     }
 }
 
-export async function getRecentTelegramLogs(limit = 100) {
+async function readRecentLogFile(file, limit) {
     let logHandle
 
     try {
-        logHandle = await open(logFile, 'r')
+        logHandle = await open(file, 'r')
     } catch (error) {
         if (error.code === 'ENOENT') {
             return []
@@ -61,51 +87,73 @@ export async function getRecentTelegramLogs(limit = 100) {
     }
 }
 
-export async function sendTelegramMessage(chatId, text) {
-    const botToken = process.env.TELEGRAM_BOT_TOKEN
+export async function getRecentTelegramLogs(limit = 100) {
+    const currentEntries = await readRecentLogFile(logFile, limit)
+    if (currentEntries.length >= limit) {
+        return currentEntries
+    }
+
+    const previousEntries = await readRecentLogFile(rotatedLogFile, limit - currentEntries.length)
+    return [...currentEntries, ...previousEntries]
+}
+
+export async function sendTelegramMessage(chatId, text, {
+    env = process.env,
+    fetchImpl = fetch,
+    logMessage = logTelegramMessage,
+    timeoutMs = requestTimeoutMs,
+} = {}) {
+    const botToken = env.TELEGRAM_BOT_TOKEN
 
     if (!botToken) {
         throw new Error('TELEGRAM_BOT_TOKEN não configurado.')
     }
 
-    const telegramUrl = new URL(`https://api.telegram.org/bot${botToken}/sendMessage`)
-    telegramUrl.searchParams.append('chat_id', chatId)
-    telegramUrl.searchParams.append('text', text)
-
     const timestamp = new Date().toISOString()
-    let result
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
+    let statusCode
+    let responseText
 
     try {
-        result = await new Promise((resolve, reject) => {
-            const tgReq = request(telegramUrl, (tgRes) => {
-                let data = ''
-                tgRes.on('data', chunk => { data += chunk })
-                tgRes.on('end', () => {
-                    resolve({ statusCode: tgRes.statusCode, data })
-                })
-                tgRes.on('error', reject)
-            })
-
-            tgReq.on('error', reject)
-            tgReq.end()
+        const response = await fetchImpl(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text }),
+            signal: controller.signal,
         })
-    } catch (error) {
-        await logTelegramMessage({
+
+        statusCode = response.status
+        responseText = await response.text()
+        const payload = JSON.parse(responseText)
+
+        if (!response.ok || payload.ok !== true) {
+            throw new Error(payload.description || `Telegram respondeu com HTTP ${statusCode}.`)
+        }
+
+        const logEntry = {
             timestamp,
             chatId,
-            text,
+            statusCode,
+            telegramMessageId: payload.result?.message_id,
+        }
+        if (env.LOG_TELEGRAM_MESSAGE_CONTENT === 'true') {
+            logEntry.text = text
+        }
+        await logMessage(logEntry)
+
+        return { statusCode, data: responseText }
+    } catch (error) {
+        await logMessage({
+            timestamp,
+            chatId,
+            ...(env.LOG_TELEGRAM_MESSAGE_CONTENT === 'true' ? { text } : {}),
+            statusCode,
             error: error.message,
+            ...(statusCode ? { response: responseText?.slice(0, 1000) } : {}),
         })
         throw error
+    } finally {
+        clearTimeout(timeout)
     }
-
-    await logTelegramMessage({
-        timestamp,
-        chatId,
-        text,
-        statusCode: result.statusCode,
-        response: result.data,
-    })
-
-    return result
 }
